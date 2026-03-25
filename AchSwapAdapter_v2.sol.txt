@@ -1,0 +1,377 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function approve(address, uint256) external returns (bool);
+    function transferFrom(address, address, uint256) external returns (bool);
+    function transfer(address, uint256) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
+}
+interface IWETH { function deposit() external payable; function withdraw(uint256) external; }
+interface IV2Factory { function getPair(address, address) external view returns (address); }
+interface IV3Factory { function getPool(address, address, uint24) external view returns (address); }
+interface IV2Router {
+    function getAmountsOut(uint256, address[] calldata) external view returns (uint256[] memory);
+    function swapExactTokensForTokens(uint256, uint256, address[] calldata, address, uint256) external returns (uint256[] memory);
+}
+interface IV3Router {
+    struct ExactInputSingleParams {
+        address tokenIn; address tokenOut; uint24 fee; address recipient;
+        uint256 deadline; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96;
+    }
+    struct ExactInputParams {
+        bytes path; address recipient; uint256 deadline; uint256 amountIn; uint256 amountOutMinimum;
+    }
+    function exactInputSingle(ExactInputSingleParams calldata) external returns (uint256);
+    function exactInput(ExactInputParams calldata) external returns (uint256);
+}
+interface IQuoterV2 {
+    struct QuoteExactInputSingleParams {
+        address tokenIn; address tokenOut; uint256 amountIn; uint24 fee; uint160 sqrtPriceLimitX96;
+    }
+    function quoteExactInputSingle(QuoteExactInputSingleParams memory) external returns (uint256, uint160, uint32, uint256);
+    function quoteExactInput(bytes memory, uint256) external returns (uint256, uint160[] memory, uint32[] memory, uint256);
+}
+
+/**
+ * One execution unit. Route = Segment[1] or Segment[2].
+ * bps values across segments must sum to 10000.
+ *
+ * isV3  false = V2 router,  true = V3 router
+ * path  token sequence [tokenIn, ...hops..., tokenOut]
+ * fees  V3 only: one per hop. Empty for V2.
+ * bps   share of total amountIn (10000 = 100%)
+ */
+struct Segment { bool isV3; address[] path; uint24[] fees; uint16 bps; }
+
+/**
+ * @title  AchSwapAdapter
+ *
+ * ── 4-line integration ────────────────────────────────────────────────────────
+ *
+ *   (uint256 expectedOut, bytes memory routeData) =
+ *       adapter.quote(tokenIn, tokenOut, amountIn);           // eth_call, free
+ *
+ *   uint256 amountOutMin = adapter.minOut(expectedOut, 1000); // 10% slippage
+ *
+ *   IERC20(tokenIn).approve(address(adapter), amountIn);
+ *
+ *   adapter.swap(tokenIn, tokenOut, amountIn, amountOutMin, recipient, routeData);
+ *
+ * ── What quote() evaluates ────────────────────────────────────────────────────
+ *   V2 direct | V3 direct (best fee tier) | V2 two-hop (via WETH) |
+ *   V3 two-hop (best fee per segment) | 50/50, 70/30, 30/70 V2+V3 splits
+ *   → returns whichever gives the highest output
+ *
+ * ── ETH ───────────────────────────────────────────────────────────────────────
+ *   Pass address(0) for tokenIn or tokenOut to use native ETH.
+ *   For ETH input: msg.value must equal amountIn, no approve needed.
+ *   For ETH output: WETH is automatically unwrapped before delivery.
+ */
+contract AchSwapAdapter {
+
+    address public immutable v2Factory;
+    address public immutable v2Router;
+    address public immutable v3Factory;
+    address public immutable v3Quoter;
+    address public immutable v3Router;
+    address public immutable WETH;
+
+    uint24[4] private V3_FEES = [100, 500, 3000, 10000];
+    uint16[3] private SPLITS  = [5000, 7000, 3000];  // bps for legA; legB = 10000 - legA
+
+    uint256 private constant _NOT = 1;
+    uint256 private constant _IN  = 2;
+    uint256 private _lock = _NOT;
+
+    modifier nonReentrant() { require(_lock != _IN, "reentrant"); _lock = _IN; _; _lock = _NOT; }
+
+    constructor(
+        address _v2Factory, address _v2Router,
+        address _v3Factory, address _v3Quoter,
+        address _v3Router,  address _weth
+    ) {
+        v2Factory=_v2Factory; v2Router=_v2Router;
+        v3Factory=_v3Factory; v3Quoter=_v3Quoter;
+        v3Router=_v3Router;   WETH=_weth;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  quote  —  eth_call only, never on-chain
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function quote(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) external returns (uint256 expectedOut, bytes memory routeData) {
+
+        address _in  = tokenIn  == address(0) ? WETH : tokenIn;
+        address _out = tokenOut == address(0) ? WETH : tokenOut;
+        require(_in != _out && amountIn > 0, "bad input");
+
+        Segment[] memory best;
+        uint256 bestOut;
+
+        // Single-leg candidates
+        { (uint256 o, Segment memory s) = _quoteV2Direct(_in, _out, amountIn);
+          if (o > bestOut) { bestOut = o; best = _one(s); } }
+
+        { (uint256 o, Segment memory s) = _quoteV3Direct(_in, _out, amountIn);
+          if (o > bestOut) { bestOut = o; best = _one(s); } }
+
+        if (_in != WETH && _out != WETH) {
+            { (uint256 o, Segment memory s) = _quoteV2Hop(_in, _out, amountIn);
+              if (o > bestOut) { bestOut = o; best = _one(s); } }
+
+            { (uint256 o, Segment memory s) = _quoteV3Hop(_in, _out, amountIn);
+              if (o > bestOut) { bestOut = o; best = _one(s); } }
+        }
+
+        // Split candidates — best V2 path vs best V3 path
+        (uint256 v2Out, Segment memory v2Leg) = _bestV2(_in, _out, amountIn);
+        (uint256 v3Out, Segment memory v3Leg) = _bestV3(_in, _out, amountIn);
+
+        if (v2Out > 0 && v3Out > 0) {
+            for (uint256 i = 0; i < SPLITS.length; ) {
+                uint16 bpsA = SPLITS[i];
+                uint16 bpsB = 10000 - bpsA;
+                uint256 inA = amountIn * bpsA / 10000;
+                uint256 combined = _reQuote(v2Leg, inA) + _reQuote(v3Leg, amountIn - inA);
+                if (combined > bestOut) {
+                    bestOut = combined;
+                    best = _two(_withBps(v2Leg, bpsA), _withBps(v3Leg, bpsB));
+                }
+                unchecked { ++i; }
+            }
+        }
+
+        require(bestOut > 0, "no liquidity");
+        return (bestOut, abi.encode(best));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  swap
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function swap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address recipient,
+        bytes calldata routeData
+    ) external payable nonReentrant returns (uint256 totalOut) {
+
+        require(amountIn > 0 && recipient != address(0), "bad input");
+
+        Segment[] memory segs = abi.decode(routeData, (Segment[]));
+        require(segs.length > 0 && segs.length <= 2, "bad route");
+
+        bool nativeIn  = tokenIn  == address(0);
+        bool nativeOut = tokenOut == address(0);
+        address _in  = nativeIn  ? WETH : tokenIn;
+        address _out = nativeOut ? WETH : tokenOut;
+
+        // Pull input
+        if (nativeIn) {
+            require(msg.value == amountIn, "ETH mismatch");
+            IWETH(WETH).deposit{value: amountIn}();
+        } else {
+            IERC20(_in).transferFrom(msg.sender, address(this), amountIn);
+        }
+
+        // Execute segments
+        uint16 bpsUsed;
+        for (uint256 i = 0; i < segs.length; ) {
+            Segment memory seg = segs[i];
+            bpsUsed += seg.bps;
+            uint256 segIn = i == segs.length - 1
+                ? IERC20(_in).balanceOf(address(this))
+                : amountIn * seg.bps / 10000;
+            totalOut += seg.isV3 ? _execV3(seg, segIn) : _execV2(seg, segIn);
+            unchecked { ++i; }
+        }
+
+        require(bpsUsed == 10000,         "bps mismatch");
+        require(totalOut >= amountOutMin, "slippage");
+
+        // Deliver output
+        if (nativeOut) {
+            uint256 bal = IERC20(WETH).balanceOf(address(this));
+            IWETH(WETH).withdraw(bal);
+            (bool ok,) = recipient.call{value: bal}("");
+            require(ok, "ETH send failed");
+        } else {
+            IERC20(_out).transfer(recipient, IERC20(_out).balanceOf(address(this)));
+        }
+
+        emit Swapped(tokenIn, tokenOut, amountIn, totalOut, recipient);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  View helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @notice 1000 bps = 10%, 50 bps = 0.5%
+    function minOut(uint256 quotedOut, uint16 slippageBps) external pure returns (uint256) {
+        require(slippageBps < 10000, ">=100%");
+        return quotedOut * (10000 - slippageBps) / 10000;
+    }
+
+    /// @notice Inspect a routeData blob — useful for debugging on the frontend.
+    function decodeRoute(bytes calldata routeData) external pure returns (Segment[] memory) {
+        return abi.decode(routeData, (Segment[]));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Internal — quoting
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function _quoteV2Direct(address tin, address tout, uint256 ain)
+        internal view returns (uint256 out, Segment memory seg)
+    {
+        if (IV2Factory(v2Factory).getPair(tin, tout) == address(0)) return (0, seg);
+        address[] memory p = _p2(tin, tout);
+        out = _v2Q(p, ain);
+        if (out > 0) seg = Segment(false, p, new uint24[](0), 10000);
+    }
+
+    function _quoteV3Direct(address tin, address tout, uint256 ain)
+        internal returns (uint256 out, Segment memory seg)
+    {
+        (uint256 o, uint24 fee) = _bestFee(tin, tout, ain);
+        if (o == 0) return (0, seg);
+        return (o, Segment(true, _p2(tin, tout), _f1(fee), 10000));
+    }
+
+    function _quoteV2Hop(address tin, address tout, uint256 ain)
+        internal view returns (uint256 out, Segment memory seg)
+    {
+        if (IV2Factory(v2Factory).getPair(tin,  WETH) == address(0)) return (0, seg);
+        if (IV2Factory(v2Factory).getPair(WETH, tout) == address(0)) return (0, seg);
+        address[] memory p = _p3(tin, WETH, tout);
+        out = _v2Q(p, ain);
+        if (out > 0) seg = Segment(false, p, new uint24[](0), 10000);
+    }
+
+    function _quoteV3Hop(address tin, address tout, uint256 ain)
+        internal returns (uint256 out, Segment memory seg)
+    {
+        (, uint24 feeA) = _bestFee(tin, WETH, ain);
+        if (feeA == 0) return (0, seg);
+        uint256 bestO; uint24 bestFeeB;
+        for (uint256 i = 0; i < V3_FEES.length; ) {
+            uint24 feeB = V3_FEES[i];
+            if (IV3Factory(v3Factory).getPool(WETH, tout, feeB) != address(0)) {
+                try IQuoterV2(v3Quoter).quoteExactInput(
+                    abi.encodePacked(tin, feeA, WETH, feeB, tout), ain
+                ) returns (uint256 o,,,) { if (o > bestO) { bestO = o; bestFeeB = feeB; } }
+                catch {}
+            }
+            unchecked { ++i; }
+        }
+        if (bestO == 0) return (0, seg);
+        uint24[] memory f = new uint24[](2); f[0] = feeA; f[1] = bestFeeB;
+        return (bestO, Segment(true, _p3(tin, WETH, tout), f, 10000));
+    }
+
+    function _bestV2(address tin, address tout, uint256 ain) internal view returns (uint256 out, Segment memory seg) {
+        (out, seg) = _quoteV2Direct(tin, tout, ain);
+        if (tin != WETH && tout != WETH) {
+            (uint256 h, Segment memory sh) = _quoteV2Hop(tin, tout, ain);
+            if (h > out) { out = h; seg = sh; }
+        }
+    }
+
+    function _bestV3(address tin, address tout, uint256 ain) internal returns (uint256 out, Segment memory seg) {
+        (out, seg) = _quoteV3Direct(tin, tout, ain);
+        if (tin != WETH && tout != WETH) {
+            (uint256 h, Segment memory sh) = _quoteV3Hop(tin, tout, ain);
+            if (h > out) { out = h; seg = sh; }
+        }
+    }
+
+    function _reQuote(Segment memory seg, uint256 ain) internal returns (uint256) {
+        if (!seg.isV3) return _v2Q(seg.path, ain);
+        if (seg.path.length == 2) {
+            try IQuoterV2(v3Quoter).quoteExactInputSingle(
+                IQuoterV2.QuoteExactInputSingleParams(seg.path[0], seg.path[1], ain, seg.fees[0], 0)
+            ) returns (uint256 o,,,) { return o; } catch { return 0; }
+        }
+        try IQuoterV2(v3Quoter).quoteExactInput(_v3Pack(seg.path, seg.fees), ain)
+            returns (uint256 o,,,) { return o; } catch { return 0; }
+    }
+
+    function _bestFee(address tin, address tout, uint256 ain) internal returns (uint256 bestOut, uint24 bestFee) {
+        for (uint256 i = 0; i < V3_FEES.length; ) {
+            uint24 fee = V3_FEES[i];
+            if (IV3Factory(v3Factory).getPool(tin, tout, fee) != address(0)) {
+                try IQuoterV2(v3Quoter).quoteExactInputSingle(
+                    IQuoterV2.QuoteExactInputSingleParams(tin, tout, ain, fee, 0)
+                ) returns (uint256 o,,,) { if (o > bestOut) { bestOut = o; bestFee = fee; } }
+                catch {}
+            }
+            unchecked { ++i; }
+        }
+    }
+
+    function _v2Q(address[] memory path, uint256 ain) internal view returns (uint256) {
+        try IV2Router(v2Router).getAmountsOut(ain, path)
+            returns (uint256[] memory a) { return a[a.length - 1]; }
+        catch { return 0; }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Internal — execution
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function _execV2(Segment memory seg, uint256 ain) internal returns (uint256) {
+        IERC20(seg.path[0]).approve(v2Router, ain);
+        uint256[] memory a = IV2Router(v2Router).swapExactTokensForTokens(
+            ain, 0, seg.path, address(this), block.timestamp
+        );
+        IERC20(seg.path[0]).approve(v2Router, 0);
+        return a[a.length - 1];
+    }
+
+    function _execV3(Segment memory seg, uint256 ain) internal returns (uint256 out) {
+        IERC20(seg.path[0]).approve(v3Router, ain);
+        if (seg.path.length == 2) {
+            out = IV3Router(v3Router).exactInputSingle(
+                IV3Router.ExactInputSingleParams(
+                    seg.path[0], seg.path[1], seg.fees[0],
+                    address(this), block.timestamp, ain, 0, 0
+                )
+            );
+        } else {
+            out = IV3Router(v3Router).exactInput(
+                IV3Router.ExactInputParams(
+                    _v3Pack(seg.path, seg.fees),
+                    address(this), block.timestamp, ain, 0
+                )
+            );
+        }
+        IERC20(seg.path[0]).approve(v3Router, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Pure micro-helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function _v3Pack(address[] memory t, uint24[] memory f) internal pure returns (bytes memory p) {
+        p = abi.encodePacked(t[0]);
+        for (uint256 i = 0; i < f.length; ) { p = abi.encodePacked(p, f[i], t[i+1]); unchecked{++i;} }
+    }
+
+    function _p2(address a, address b) internal pure returns (address[] memory p) { p = new address[](2); p[0]=a; p[1]=b; }
+    function _p3(address a, address b, address c) internal pure returns (address[] memory p) { p = new address[](3); p[0]=a; p[1]=b; p[2]=c; }
+    function _f1(uint24 f) internal pure returns (uint24[] memory arr) { arr = new uint24[](1); arr[0]=f; }
+    function _one(Segment memory s) internal pure returns (Segment[] memory a) { a = new Segment[](1); a[0]=s; }
+    function _two(Segment memory a, Segment memory b) internal pure returns (Segment[] memory arr) { arr = new Segment[](2); arr[0]=a; arr[1]=b; }
+    function _withBps(Segment memory s, uint16 bps) internal pure returns (Segment memory) { return Segment(s.isV3, s.path, s.fees, bps); }
+
+    event Swapped(address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut, address recipient);
+
+    receive() external payable {}
+}
