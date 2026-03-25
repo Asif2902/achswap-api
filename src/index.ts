@@ -79,8 +79,12 @@ export default {
 			if (!routeData) return errorJson('Missing routeData');
 
 			try {
-				const segments = await decodeRoute(routeData);
-				return json({ segments });
+			const rawSegments = await decodeRoute(routeData) as any[];
+			const segments = rawSegments.map((s: any) => ({
+				...s,
+				bps: s.isV3 ? s.bps : 30,
+			}));
+			return json({ segments });
 			} catch (e: any) {
 				return errorJson(e.message ?? 'Decode failed', 500);
 			}
