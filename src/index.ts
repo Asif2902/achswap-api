@@ -82,7 +82,8 @@ export default {
 			const rawSegments = await decodeRoute(routeData) as any[];
 			const segments = rawSegments.map((s: any) => ({
 				...s,
-				bps: s.isV3 ? s.bps : 30,
+				bps: Number(s.bps),
+				fees: s.isV3 ? s.fees : [3000],
 			}));
 			return json({ segments });
 			} catch (e: any) {

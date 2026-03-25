@@ -4,6 +4,21 @@ import { ADAPTER_ABI } from './abi';
 
 const client = createPublicClient({ chain: ARC_TESTNET, transport });
 
+// quote() makes 20+ external calls (V2 router, V3 quoter, factories, pool checks).
+// Ethers auto-estimates gas; viem does not. Without an explicit limit the RPC's
+// default gas cap can cut off complex hop+split routes mid-execution.
+const QUOTE_GAS = 25_000_000n;
+
+async function withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 500): Promise<T> {
+	try {
+		return await fn();
+	} catch (e: any) {
+		if (retries <= 0) throw e;
+		await new Promise((r) => setTimeout(r, delay));
+		return withRetry(fn, retries - 1, delay * 2);
+	}
+}
+
 function resolveToken(raw: string): Address {
 	if (raw === 'native' || raw === 'USDC' || raw === '') return ZERO_ADDRESS;
 	return raw as Address;
@@ -23,7 +38,9 @@ export async function quote(
 		args: [tIn, tOut, amountIn],
 	});
 
-	const raw = await client.call({ to: ADAPTER_ADDRESS, data });
+	const raw = await withRetry(() =>
+		client.call({ to: ADAPTER_ADDRESS, data, gas: QUOTE_GAS }),
+	);
 
 	const decoded = decodeFunctionResult({
 		abi: ADAPTER_ABI,
@@ -48,7 +65,9 @@ export async function quoteMinOut(
 		args: [expectedOut, slippageBps],
 	});
 
-	const minRaw = await client.call({ to: ADAPTER_ADDRESS, data: minData });
+	const minRaw = await withRetry(() =>
+		client.call({ to: ADAPTER_ADDRESS, data: minData }),
+	);
 
 	const minDecoded = decodeFunctionResult({
 		abi: ADAPTER_ABI,
