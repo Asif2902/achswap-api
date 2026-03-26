@@ -19,12 +19,6 @@ function errorJson(message: string, status = 400): Response {
 	return json({ error: message }, status);
 }
 
-function parseAmount(raw: string, decimals: number): bigint {
-	const [whole, frac = ''] = raw.split('.');
-	const padded = frac.padEnd(decimals, '0').slice(0, decimals);
-	return BigInt(whole || '0') * 10n ** BigInt(decimals) + BigInt(padded);
-}
-
 export default {
 	async fetch(request: Request): Promise<Response> {
 		if (request.method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
@@ -40,20 +34,19 @@ export default {
 			});
 		}
 
-		// ── GET /quote?tokenIn=&tokenOut=&amountIn=&slippageBps=&decimals= ───
+		// ── GET /quote?tokenIn=&tokenOut=&amountIn=&slippageBps= ───────────
 		if (url.pathname === '/quote' && request.method === 'GET') {
 			const tokenIn = url.searchParams.get('tokenIn');
 			const tokenOut = url.searchParams.get('tokenOut');
 			const amountInRaw = url.searchParams.get('amountIn');
 			const slippageBps = Number(url.searchParams.get('slippageBps') ?? '50');
-			const decimals = Number(url.searchParams.get('decimals') ?? '18');
 
 			if (!tokenIn || !tokenOut || !amountInRaw) {
 				return errorJson('Missing tokenIn, tokenOut, or amountIn');
 			}
 
 			try {
-				const amountIn = parseAmount(amountInRaw, decimals);
+				const amountIn = BigInt(amountInRaw);
 				if (amountIn <= 0n) return errorJson('amountIn must be > 0');
 
 				const result = await quoteMinOut(tokenIn, tokenOut, amountIn, slippageBps);
